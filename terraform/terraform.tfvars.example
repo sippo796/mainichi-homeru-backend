@@ -1,0 +1,13 @@
+# Example terraform.tfvars file
+# Copy this to terraform.tfvars and customize the values
+
+aws_region    = "ap-northeast-1"
+environment   = "prod"
+project_name  = "mainichi-homeru"
+
+# SSM parameter where Claude API key is stored
+claude_api_key_parameter = "/mainichi-homeru/claude-api-key"
+
+# Lambda settings
+lambda_runtime = "python3.9"
+lambda_timeout = 30

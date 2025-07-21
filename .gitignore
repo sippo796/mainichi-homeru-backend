@@ -1,0 +1,20 @@
+# Environment variables
+.env*
+env.json
+
+# AWS credentials
+.aws/
+credentials
+
+# Build artifacts
+.aws-sam/
+dist/
+
+# Logs
+*.log
+
+# API keys and configurations
+samconfig.toml
+*secret*
+*key*
+*token*
