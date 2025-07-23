@@ -93,18 +93,26 @@ def lambda_handler(event, context):
         )
 
         content = response['Body'].read().decode('utf-8')
+        
+        # ETagを生成（S3のETagとlastModifiedを使用）
+        s3_etag = response.get('ETag', '').strip('"')
+        last_modified = response['LastModified'].isoformat()
+        
+        import hashlib
+        content_hash = hashlib.md5(f"{s3_etag}:{last_modified}:{len(content)}".encode()).hexdigest()[:8]
 
         return {
             'statusCode': 200,
             'headers': {
                 'Content-Type': 'application/json',
                 'Access-Control-Allow-Origin': '*',
-                'Cache-Control': 'public, max-age=3600'
+                'Cache-Control': 'public, max-age=3600',
+                'ETag': f'"{content_hash}"'
             },
             'body': json.dumps({
                 'date': date,
                 'content': content,
-                'lastModified': response['LastModified'].isoformat()
+                'lastModified': last_modified
             }, ensure_ascii=False)
         }
 

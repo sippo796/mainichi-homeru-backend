@@ -13,9 +13,28 @@ data "archive_file" "get_article" {
 
 
 
+# Build dependencies for mcp_orchestrator
+resource "null_resource" "mcp_orchestrator_deps" {
+  triggers = {
+    requirements = filemd5("../lambdas/mcp_orchestrator/requirements.txt")
+    app_code     = filemd5("../lambdas/mcp_orchestrator/app.py")
+  }
+
+  provisioner "local-exec" {
+    command = <<EOF
+      cd ../lambdas/mcp_orchestrator
+      rm -rf build/
+      mkdir -p build/
+      python3 -m pip install -r requirements.txt -t build/
+      cp app.py build/
+    EOF
+  }
+}
+
 data "archive_file" "mcp_orchestrator" {
+  depends_on = [null_resource.mcp_orchestrator_deps]
   type        = "zip"
-  source_dir  = "../lambdas/mcp_orchestrator"
+  source_dir  = "../lambdas/mcp_orchestrator/build"
   output_path = "mcp_orchestrator.zip"
 }
 
