@@ -132,12 +132,43 @@ def lambda_handler(event, context):
                 logger.error(f"Error processing {obj['Key']}: {str(e)}")
                 continue
 
+        # 動的キャッシュ制御とETag生成
+        from datetime import datetime, timezone, timedelta
+        import hashlib
+        
+        jst = timezone(timedelta(hours=9))
+        today = datetime.now(jst).strftime('%Y-%m-%d')
+        
+        # 今日の記事があるかチェック
+        has_todays_article = any(article['date'] == today for article in articles)
+        
+        # キャッシュ時間：今日の記事がある場合は長時間、ない場合は短時間
+        cache_seconds = 3600 if has_todays_article else 60  # 1時間 or 1分
+        
+        # ETag生成（記事の日付とタイトルから）
+        etag_data = ''.join([f"{a['date']}{a['title']}" for a in articles])
+        etag = hashlib.md5(etag_data.encode('utf-8')).hexdigest()
+        
+        # If-None-Match チェック
+        request_etag = event.get('headers', {}).get('If-None-Match')
+        if request_etag == f'"{etag}"':
+            return {
+                'statusCode': 304,
+                'headers': {
+                    'ETag': f'"{etag}"',
+                    'Cache-Control': f'public, max-age={cache_seconds}',
+                    'Access-Control-Allow-Origin': '*'
+                }
+            }
+        
         return {
             'statusCode': 200,
             'headers': {
                 'Content-Type': 'application/json',
                 'Access-Control-Allow-Origin': '*',
-                'Cache-Control': 'public, max-age=300'
+                'Cache-Control': f'public, max-age={cache_seconds}',
+                'ETag': f'"{etag}"',
+                'Last-Modified': articles[0]['lastModified'] if articles else datetime.now(jst).isoformat()
             },
             'body': json.dumps({'articles': articles}, ensure_ascii=False)
         }
