@@ -9,9 +9,54 @@ credentials
 # Build artifacts
 .aws-sam/
 dist/
+build/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Dependency directories
+node_modules/
+*-packages/
+
+# Distribution / packaging
+.Python
+*.egg-info/
+*.egg
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
 
 # Logs
 *.log
+
+# Data directories (scraped content)
+scraped_data/
+rss_scraped_data/
+*_scraped_data/
+
+# Temporary files
+*.tmp
+*.temp
 
 # API keys and configurations
 samconfig.toml
