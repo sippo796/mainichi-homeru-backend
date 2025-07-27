@@ -1,0 +1,24 @@
+# ベイスターズニュース収集・褒め記事生成システム 依存関係
+# 
+# インストール方法:
+# pip install -r requirements.txt
+
+# Webスクレイピング
+requests==2.32.4
+beautifulsoup4==4.13.4
+
+# AWS SDK
+boto3==1.39.14
+
+# 基本的な依存関係 (上記パッケージと一緒にインストールされます)
+botocore==1.39.14
+certifi==2025.7.14
+charset-normalizer==3.4.2
+idna==3.10
+jmespath==1.0.1
+python-dateutil==2.9.0.post0
+s3transfer==0.13.1
+six==1.17.0
+soupsieve==2.7
+typing_extensions==4.14.1
+urllib3==2.5.0

@@ -1,16 +1,540 @@
 import json
 import boto3
 import os
-from datetime import datetime
+import re
+import time
+import hashlib
+from datetime import datetime, timedelta
+import pytz
 import logging
 from typing import Dict, List, Any
 import asyncio
+import urllib.request
+import urllib.error
+from urllib.parse import urljoin, urlparse, quote
+from pathlib import Path
+
+# Lambda環境でのモジュールローディング確保
+try:
+    import feedparser
+    logger_feedparser_status = "feedparser imported successfully"
+except ImportError as e:
+    logger_feedparser_status = f"feedparser import failed: {e}"
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 s3_client = boto3.client('s3')
 lambda_client = boto3.client('lambda')
+
+class BaystarsRSSNewsCollector:
+    """Google News RSS経由でベイスターズニュースを取得する高速スクレイパー"""
+    
+    def __init__(self):
+        import urllib.request
+        self.session_headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        # 重複チェック用のハッシュ保存（Lambda環境では一時的）
+        self.seen_articles = set()
+        
+        # 推し選手リスト（個別検索用）
+        self.featured_players = []
+        
+        # 全体検索クエリ
+        self.general_queries = [
+            "横浜DeNAベイスターズ",
+            "横浜DeNAベイスターズ 試合"
+        ]
+        
+        # 旧システム互換性のため
+        self.search_queries = self.general_queries
+        
+        # ベイスターズ関連キーワード（強化版）
+        self.baystars_keywords = [
+            'ベイスターズ', 'DeNA', '横浜', 'baystars', 'dena', 'yokohama',
+            '佐野', '牧', '宮崎', '森', '関根', '桑原', '大和', '三浦',
+            '今永', '大貫', '東', '上茶谷', '平良', '入江', '伊勢', '山崎',
+            '戸柱', '益子', '蝦名', '京田', '松尾', '石川',
+            '藤浪', 'ビシエド', '橋本達弥'
+        ]
+
+    def _generate_article_hash(self, url, title):
+        """記事の一意ハッシュを生成"""
+        content = f"{url}#{title}".encode('utf-8')
+        return hashlib.md5(content).hexdigest()
+
+    def _is_baystars_related(self, text):
+        """テキストがベイスターズ関連かチェック"""
+        if not text:
+            return False
+        text_lower = text.lower()
+        return any(keyword.lower() in text_lower for keyword in self.baystars_keywords)
+
+    def fetch_rss_feed(self, query):
+        """Google News RSSフィードを取得"""
+        try:
+            # Google News RSS URL構築
+            encoded_query = quote(query)
+            rss_url = f"https://news.google.com/rss/search?q={encoded_query}&hl=ja&gl=JP&ceid=JP:ja"
+            
+            logger.info(f"📡 RSS取得中: {query}")
+            
+            # feedparserを使用してRSS解析
+            try:
+                import feedparser
+                feed = feedparser.parse(rss_url)
+                if feed.bozo:
+                    logger.warning(f"⚠️  RSS解析警告: {feed.bozo_exception}")
+                return feed
+            except ImportError as import_err:
+                logger.error(f"feedparser import failed: {import_err}")
+                # feedparserがない場合の代替実装
+                logger.warning("feedparser not available, using fallback RSS parsing")
+                return self._parse_rss_manually(rss_url)
+            
+        except Exception as e:
+            logger.error(f"❌ RSS取得エラー ({query}): {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return None
+
+    def _parse_rss_manually(self, rss_url):
+        """feedparserが使用できない場合の手動RSS解析"""
+        try:
+            import urllib.request
+            import xml.etree.ElementTree as ET
+            
+            req = urllib.request.Request(rss_url, headers=self.session_headers)
+            with urllib.request.urlopen(req, timeout=10) as response:
+                xml_content = response.read().decode('utf-8')
+            
+            # 簡単なXML解析
+            root = ET.fromstring(xml_content)
+            
+            # RSS エントリを抽出
+            entries = []
+            for item in root.findall('.//item'):
+                entry = {}
+                title_elem = item.find('title')
+                link_elem = item.find('link')
+                desc_elem = item.find('description')
+                pub_elem = item.find('pubDate')
+                
+                if title_elem is not None:
+                    entry['title'] = title_elem.text
+                if link_elem is not None:
+                    entry['link'] = link_elem.text
+                if desc_elem is not None:
+                    entry['summary'] = desc_elem.text
+                if pub_elem is not None:
+                    entry['published'] = pub_elem.text
+                    
+                # ソース情報を抽出（可能であれば）
+                source_elem = item.find('.//{http://search.yahoo.com/mrss/}credit')
+                if source_elem is not None:
+                    entry['source'] = {'title': source_elem.text}
+                else:
+                    entry['source'] = {'title': 'Google News'}
+                
+                entries.append(entry)
+            
+            # feedparserライクなオブジェクトを作成
+            class FeedLike:
+                def __init__(self, entries):
+                    self.entries = entries
+                    self.bozo = False
+            
+            return FeedLike(entries)
+            
+        except Exception as e:
+            logger.error(f"Manual RSS parsing failed: {e}")
+            return None
+
+    def extract_article_from_rss_item(self, item):
+        """RSS itemから記事情報を抽出"""
+        try:
+            # 基本情報をRSSから取得
+            article_data = {
+                'title': item.get('title', ''),
+                'url': item.get('link', ''),
+                'summary': item.get('summary', ''),
+                'publish_date': item.get('published', ''),
+                'source': item.get('source', {}).get('title', 'Google News'),
+                'scraped_at': datetime.now().isoformat(),
+                'content': '',
+                'images': [],
+                'is_baystars_related': False,
+                'baystars_keywords_found': [],
+                'collection_method': 'google_news_rss',
+                'player_relevance_score': 0,
+                'is_player_focused': False
+            }
+            
+            # HTMLタグを除去して純粋なテキストを取得
+            if article_data['summary']:
+                # 簡単なHTMLタグ除去
+                import re
+                article_data['summary'] = re.sub(r'<[^>]*>', '', article_data['summary']).strip()
+            
+            # ベイスターズ関連判定
+            full_text = f"{article_data['title']} {article_data['summary']}"
+            article_data['is_baystars_related'] = self._is_baystars_related(full_text)
+            
+            # 見つかったキーワード記録
+            found_keywords = []
+            for keyword in self.baystars_keywords:
+                if keyword.lower() in full_text.lower():
+                    found_keywords.append(keyword)
+            article_data['baystars_keywords_found'] = found_keywords
+            
+            # 選手関連度の判定を追加
+            player_score, is_player_focused = self._assess_player_relevance(full_text)
+            article_data['player_relevance_score'] = player_score
+            article_data['is_player_focused'] = is_player_focused
+            
+            return article_data
+            
+        except Exception as e:
+            logger.error(f"❌ RSS記事抽出エラー: {e}")
+            return None
+
+    def _assess_player_relevance(self, text):
+        """記事の選手関連度を評価"""
+        
+        # 選手名リスト（より包括的）
+        player_names = [
+            # 現役選手名（苗字のみでも検出）
+            '佐野', '牧', '宮崎', '京田', '松尾', '戸柱', '桑原', '神里', '関根', '蝦名',
+            '東', '大貫', 'バウアー', 'ジャクソン', '伊勢', '山崎', '入江', '森原', '石田',
+            '柴田', '井上', 'フォード', '林', '石上',
+            # フルネーム
+            '佐野恵太', '牧秀悟', '宮崎敏郎', '京田陽太', '松尾汐恩', '戸柱恭孝',
+            '桑原将志', '神里和毅', '関根大気', '蝦名達夫',
+            '東克樹', '大貫晋一', '伊勢大夢', '山崎康晃'
+        ]
+        
+        # 選手関連キーワード
+        player_keywords = [
+            '活躍', '打撃', '投球', '守備', '好調', '不調', '復活', 'ホームラン', 'ヒット',
+            '先発', '登板', '勝利', '敗戦', '好投', '完投', '救援', 'セーブ', '奪三振',
+            '打点', '得点', '盗塁', '併殺', 'エラー', '好守', '送球', 'キャッチング',
+            '調子', '成績', '打率', '防御率', '勝率', 'OPS', 'ERA',
+            '練習', 'トレーニング', 'コンディション', '怪我', '復帰', '離脱',
+            '移籍', 'トレード', '契約', '年俸', 'FA', '残留', '獲得', '放出'
+        ]
+        
+        # 非選手関連キーワード（これらがあると減点）
+        non_player_keywords = [
+            'スポンサー', '協賛', '企業', '契約', '提携', 'パートナーシップ',
+            'イベント', 'グッズ', '商品', 'キャンペーン', '販売', '価格',
+            'ファンクラブ', 'チケット', '入場', '観客', '動員', '売上',
+            '球団', '経営', '運営', '社長', '監督人事', 'コーチ', 'スタッフ',
+            '施設', 'スタジアム', '改修', '工事', '建設', 'アクセス'
+        ]
+        
+        score = 0
+        text_lower = text.lower()
+        
+        # 選手名の検出（高配点）
+        for player in player_names:
+            if player in text:
+                score += 3  # 選手名は高得点
+        
+        # 選手関連キーワードの検出
+        for keyword in player_keywords:
+            if keyword in text:
+                score += 1
+        
+        # 非選手関連キーワードの検出（減点）
+        for keyword in non_player_keywords:
+            if keyword in text:
+                score -= 2
+        
+        # 試合関連かどうかの判定（選手と関連しやすい）
+        game_keywords = ['試合', '対戦', '勝利', '敗戦', '勝負', '戦い', 'vs', '戦']
+        for keyword in game_keywords:
+            if keyword in text:
+                score += 1
+        
+        # 選手重視判定
+        is_player_focused = score >= 3  # 3点以上で選手関連とみなす
+        
+        return max(0, score), is_player_focused
+
+    def set_featured_players(self, players):
+        """推し選手を設定"""
+        self.featured_players = players
+        logger.info(f"🎯 推し選手設定: {', '.join(players)}")
+
+    def collect_player_specific_news(self, player_name, max_articles=5):
+        """特定選手の個別ニュース収集"""
+        logger.info(f"🔍 {player_name} 選手の個別ニュース検索開始...")
+        
+        # 選手名での検索クエリ生成
+        player_queries = [
+            f"{player_name} 横浜DeNA",
+            f"{player_name} ベイスターズ",
+            f"{player_name}"
+        ]
+        
+        player_articles = []
+        
+        for query in player_queries:
+            logger.info(f"   📋 クエリ: {query}")
+            
+            feed = self.fetch_rss_feed(query)
+            if not feed or not hasattr(feed, 'entries'):
+                continue
+            
+            logger.info(f"   📊 RSS記事数: {len(feed.entries)} 件")
+            
+            for i, item in enumerate(feed.entries[:max_articles], 1):
+                title = item.get('title', '')
+                url = item.get('link', '')
+                
+                # 重複チェック
+                article_hash = self._generate_article_hash(url, title)
+                if article_hash in self.seen_articles:
+                    logger.info(f"   [{i:2d}] ⏭️  スキップ (既処理): {title[:40]}...")
+                    continue
+                
+                # ベイスターズ関連 + 対象選手言及チェック
+                article_data = self.extract_article_from_rss_item(item)
+                if article_data and self._is_player_mentioned(article_data, player_name):
+                    self.seen_articles.add(article_hash)
+                    article_data['hash'] = article_hash
+                    article_data['query_used'] = query
+                    article_data['target_player'] = player_name
+                    article_data['search_type'] = 'player_specific'
+                    
+                    player_articles.append(article_data)
+                    
+                    logger.info(f"   [{i:2d}] ✅ {player_name}選手関連記事を収集")
+                    logger.info(f"        📰 {title[:50]}...")
+                    logger.info(f"        🏷️  キーワード: {', '.join(article_data['baystars_keywords_found'][:3])}")
+                    
+                    # 選手個別検索では少数精鋭で
+                    if len(player_articles) >= 3:
+                        break
+            
+            # 十分な記事が見つかったら次のクエリはスキップ
+            if len(player_articles) >= 3:
+                break
+            
+            time.sleep(1)  # レート制限
+        
+        logger.info(f"   📊 {player_name}選手の記事: {len(player_articles)} 件収集")
+        return player_articles
+
+    def _is_player_mentioned(self, article_data, player_name):
+        """記事に特定選手が言及されているかチェック"""
+        if not article_data['is_baystars_related']:
+            return False
+        
+        full_text = f"{article_data['title']} {article_data['summary']}"
+        
+        # 選手名の様々なパターンをチェック
+        name_patterns = [
+            player_name,  # フルネーム
+            player_name.split()[0] if ' ' in player_name else player_name,  # 苗字のみ
+        ]
+        
+        # 苗字だけの場合も追加
+        if len(player_name) > 2:
+            name_patterns.append(player_name[:2])  # 最初の2文字（苗字）
+        
+        for pattern in name_patterns:
+            if pattern in full_text:
+                return True
+        
+        return False
+
+    def collect_general_baystars_news(self, max_articles=5):
+        """ベイスターズ全体のニュース収集"""
+        logger.info(f"🔄 ベイスターズ全体ニュース収集開始...")
+        
+        general_articles = []
+        
+        for query in self.general_queries:
+            logger.info(f"📋 全体クエリ: {query}")
+            
+            feed = self.fetch_rss_feed(query)
+            if not feed or not hasattr(feed, 'entries'):
+                continue
+            
+            logger.info(f"   📊 RSS記事数: {len(feed.entries)} 件")
+            
+            for i, item in enumerate(feed.entries[:max_articles], 1):
+                title = item.get('title', '')
+                url = item.get('link', '')
+                
+                # 重複チェック
+                article_hash = self._generate_article_hash(url, title)
+                if article_hash in self.seen_articles:
+                    continue
+                
+                article_data = self.extract_article_from_rss_item(item)
+                if article_data and article_data['is_baystars_related']:
+                    self.seen_articles.add(article_hash)
+                    article_data['hash'] = article_hash
+                    article_data['query_used'] = query
+                    article_data['search_type'] = 'general_team'
+                    
+                    general_articles.append(article_data)
+                    
+                    logger.info(f"   [{i:2d}] ✅ 全体ニュースを収集")
+                    logger.info(f"        📰 {title[:50]}...")
+            
+            time.sleep(1)
+        
+        logger.info(f"📊 全体ニュース: {len(general_articles)} 件収集")
+        return general_articles
+
+    def collect_comprehensive_news(self, featured_players, max_per_player=3, max_general=5):
+        """推し選手 + 全体ニュースの包括的収集"""
+        logger.info(f"🎯 包括的ニュース収集開始 (推し選手: {len(featured_players)}名, 全体ニュース: {max_general}件)")
+        
+        self.set_featured_players(featured_players)
+        
+        all_articles = []
+        player_articles_by_name = {}
+        
+        # 1. 推し選手個別検索
+        for player in featured_players:
+            player_articles = self.collect_player_specific_news(player, max_per_player)
+            player_articles_by_name[player] = player_articles
+            all_articles.extend(player_articles)
+        
+        # 2. ベイスターズ全体検索
+        general_articles = self.collect_general_baystars_news(max_general)
+        all_articles.extend(general_articles)
+        
+        # 結果をログ出力
+        logger.info(f"\n📊 包括的収集結果:")
+        logger.info(f"   🎯 推し選手記事: {sum(len(articles) for articles in player_articles_by_name.values())} 件")
+        for player, articles in player_articles_by_name.items():
+            logger.info(f"     - {player}: {len(articles)} 件")
+        logger.info(f"   📰 全体記事: {len(general_articles)} 件")
+        logger.info(f"   📊 合計: {len(all_articles)} 件")
+        
+        return {
+            'all_articles': all_articles,
+            'player_articles': player_articles_by_name,
+            'general_articles': general_articles,
+            'summary': {
+                'total_articles': len(all_articles),
+                'player_articles_count': sum(len(articles) for articles in player_articles_by_name.values()),
+                'general_articles_count': len(general_articles),
+                'featured_players': featured_players
+            }
+        }
+
+    def collect_news_from_multiple_queries(self, max_articles_per_query=10):
+        """複数のクエリでニュースを収集"""
+        logger.info(f"🔄 {len(self.search_queries)} 種類のクエリでRSSニュース収集開始...")
+        
+        all_articles = []
+        new_articles_count = 0
+        
+        for i, query in enumerate(self.search_queries, 1):
+            logger.info(f"📋 クエリ {i}/{len(self.search_queries)}: {query}")
+            
+            # RSSフィード取得
+            feed = self.fetch_rss_feed(query)
+            if not feed or not hasattr(feed, 'entries'):
+                logger.info(f"   ❌ フィード取得失敗")
+                continue
+            
+            logger.info(f"   📊 RSS記事数: {len(feed.entries)} 件")
+            
+            query_articles = []
+            
+            for j, item in enumerate(feed.entries[:max_articles_per_query], 1):
+                title = item.get('title', '')
+                url = item.get('link', '')
+                
+                # 重複チェック
+                article_hash = self._generate_article_hash(url, title)
+                if article_hash in self.seen_articles:
+                    logger.info(f"   [{j:2d}] ⏭️  スキップ (既処理): {title[:40]}...")
+                    continue
+                
+                logger.info(f"   [{j:2d}] 🆕 処理中: {title[:40]}...")
+                
+                # RSS記事データ抽出
+                article_data = self.extract_article_from_rss_item(item)
+                
+                if article_data and article_data['is_baystars_related']:
+                    # 新しい記事として記録
+                    self.seen_articles.add(article_hash)
+                    article_data['hash'] = article_hash
+                    article_data['query_used'] = query
+                    
+                    query_articles.append(article_data)
+                    all_articles.append(article_data)
+                    new_articles_count += 1
+                    
+                    # 選手関連度によるログ表示
+                    player_status = "🏆 選手中心" if article_data['is_player_focused'] else "📰 一般"
+                    logger.info(f"        ✅ ベイスターズ関連記事として収集 ({player_status})")
+                    logger.info(f"        🏷️  キーワード: {', '.join(article_data['baystars_keywords_found'][:3])}")
+                    logger.info(f"        📊 選手関連度: {article_data['player_relevance_score']}点")
+                    logger.info(f"        📰 ソース: {article_data['source']}")
+                    
+                else:
+                    logger.info(f"        ⏭️  ベイスターズ関連ではないためスキップ")
+            
+            logger.info(f"   📊 クエリ結果: {len(query_articles)} 件の新記事")
+            
+            # レート制限（Google News APIに優しく）
+            time.sleep(1)
+        
+        logger.info(f"📊 RSS収集完了: {new_articles_count} 件の新しいベイスターズ記事を取得")
+        return all_articles
+
+    def generate_summary_report(self, articles):
+        """収集結果のサマリーレポートを生成"""
+        if not articles:
+            return "📭 新しい記事は見つかりませんでした"
+        
+        # 統計情報
+        total_articles = len(articles)
+        sources = {}
+        keywords_count = {}
+        
+        for article in articles:
+            # ソース別統計
+            source = article.get('source', 'Unknown')
+            sources[source] = sources.get(source, 0) + 1
+            
+            # キーワード別統計
+            for keyword in article.get('baystars_keywords_found', []):
+                keywords_count[keyword] = keywords_count.get(keyword, 0) + 1
+        
+        # レポート生成
+        report = [
+            f"📊 ベイスターズRSSニュース収集レポート",
+            f"🎯 新規記事数: {total_articles} 件",
+            f"📰 情報ソース数: {len(sources)} サイト",
+        ]
+        
+        # ソース別表示（上位5つ）
+        if sources:
+            report.append("📈 主要ソース:")
+            sorted_sources = sorted(sources.items(), key=lambda x: x[1], reverse=True)
+            for source, count in sorted_sources[:5]:
+                report.append(f"   {source}: {count} 件")
+        
+        # キーワード別表示（上位5個）
+        if keywords_count:
+            report.append("🏷️  頻出キーワード:")
+            sorted_keywords = sorted(keywords_count.items(), key=lambda x: x[1], reverse=True)
+            for keyword, count in sorted_keywords[:5]:
+                report.append(f"   {keyword}: {count} 回")
+        
+        return "\n".join(report)
 
 class MCPAgent:
     """MCPエージェントの基底クラス"""
@@ -59,28 +583,16 @@ class DataCollectionAgent(MCPAgent):
         }
     
     async def _fetch_game_info(self) -> Dict[str, Any]:
-        """試合情報を取得（FetchGameInfo Lambda呼び出し）"""
+        """Yahoo!スポーツスクレイピングでベイスターズ関連の最新ニュースを検索・分析"""
         
         try:
-            # FetchGameInfo関数を呼び出し
-            function_name = self._find_function_by_name('FetchGameInfo')
+            # Yahoo!スポーツスクレイピングで最新のベイスターズニュースを収集
+            news_info = await self._search_baystars_news()
             
-            if function_name:
-                response = lambda_client.invoke(
-                    FunctionName=function_name,
-                    InvocationType='RequestResponse',
-                    Payload=json.dumps({})
-                )
-                
-                payload = json.loads(response['Payload'].read())
-                if payload.get('statusCode') == 200:
-                    body = json.loads(payload['body'])
-                    return body.get('game_info', {})
-            
-            return self._get_fallback_game_info()
+            return news_info
             
         except Exception as e:
-            self.logger.error(f"Error fetching game info: {e}")
+            self.logger.error(f"Error fetching recent news: {e}")
             return self._get_fallback_game_info()
     
     async def _fetch_current_players(self) -> Dict[str, Any]:
@@ -109,15 +621,24 @@ class DataCollectionAgent(MCPAgent):
         import random
         from datetime import datetime
         
-        today = datetime.now()
+        # テスト用時間偽装の確認
+        mock_hour = os.environ.get('MOCK_TIME_HOUR')
+        if mock_hour:
+            # 偽装時間での日時作成（現在の日付 + 偽装時間）
+            now = datetime.now()
+            today = now.replace(hour=int(mock_hour), minute=0, second=0, microsecond=0)
+            logger.info(f"🕙 選手選択で時間偽装使用: {today.hour}時")
+        else:
+            today = datetime.now()
         
         # 複数のランダム要素を組み合わせてシードを作成
         base_seed = today.day + today.month + today.year
         weather_factor = (today.day * 7) % 13  # 天気っぽいランダム要素
         season_factor = (today.month - 1) // 3  # 季節要素（0-3）
         lunar_cycle = today.day % 28  # 月齢っぽいサイクル
+        time_factor = today.hour * 17  # 時間要素を追加（17倍で変化を大きく）
         
-        random.seed(base_seed + weather_factor + season_factor + lunar_cycle)
+        random.seed(base_seed + weather_factor + season_factor + lunar_cycle + time_factor)
         
         # 曜日別の選手選択傾向
         weekday_focus = {
@@ -186,18 +707,186 @@ class DataCollectionAgent(MCPAgent):
         return selected_players
     
     async def _fetch_news(self) -> List[str]:
-        """ニュース情報を取得"""
+        """RSS経由でベイスターズニュースを取得"""
         
-        # 実際のニュースAPIまたはスクレイピングの代わりに
-        # 季節や状況に応じたポジティブニュースを生成
-        season_news = [
+        try:
+            # RSS ニュース収集を実行
+            rss_collector = BaystarsRSSNewsCollector()
+            articles = rss_collector.collect_news_from_multiple_queries(max_articles_per_query=10)
+            
+            # 記事タイトルをリストとして返す
+            news_titles = [article.get('title', '') for article in articles[:5]]
+            
+            if news_titles:
+                self.logger.info(f"RSS収集成功: {len(news_titles)}件のニュースを取得")
+                return news_titles
+            else:
+                self.logger.warning("RSS収集: 新しい記事が見つかりませんでした")
+                return self._get_fallback_news()
+                
+        except Exception as e:
+            self.logger.error(f"RSS収集エラー: {e}")
+            return self._get_fallback_news()
+    
+    def _get_fallback_news(self) -> List[str]:
+        """フォールバック用のニュース"""
+        return [
             "チーム一丸となって今シーズンも頑張っています",
             "若手選手の成長が著しく、期待が高まります",
             "ファンの皆様の熱い声援がチームの力になっています",
             "練習に励む選手たちの姿が輝いています"
-        ]
+        ][:2]
+    
+    def _get_news_api_key(self) -> str:
+        """News API Keyを取得"""
         
-        return season_news[:2]  # 最新2件
+        try:
+            ssm_client = boto3.client('ssm')
+            parameter_name = os.environ.get('OPENAI_API_KEY_PARAMETER', '/mainichi-homeru/openai-api-key')
+            response = ssm_client.get_parameter(
+                Name=parameter_name,
+                WithDecryption=True
+            )
+            return response['Parameter']['Value']
+        except Exception as e:
+            self.logger.error(f"Failed to get News API key: {e}")
+            return os.environ.get('NEWS_API_KEY', 'test-key')
+    
+    async def _search_baystars_news(self, api_key: str = None) -> Dict[str, Any]:
+        """Google News RSS経由で推し選手個別 + ベイスターズ全体ニュースを収集"""
+        
+        try:
+            self.logger.info("Starting comprehensive RSS collection for featured players + team news...")
+            
+            # 推し選手を取得（選手情報から）
+            player_info = await self._fetch_current_players()
+            featured_players = player_info.get('featured_players', ['佐野恵太', '牧秀悟', '松尾汐恩'])
+            
+            # 推し選手個別 + 全体ニュース収集
+            rss_collector = BaystarsRSSNewsCollector()
+            comprehensive_result = rss_collector.collect_comprehensive_news(
+                featured_players=featured_players,
+                max_per_player=3,
+                max_general=5
+            )
+            
+            articles = comprehensive_result['all_articles']
+            player_articles = comprehensive_result['player_articles']
+            general_articles = comprehensive_result['general_articles']
+            
+            if articles:
+                # 記事生成用の形式に変換（推し選手別に整理）
+                recent_news = []
+                trending_players = featured_players  # 推し選手を優先
+                positive_highlights = []
+                
+                # 推し選手別の記事整理
+                player_news_summary = {}
+                for player, player_arts in player_articles.items():
+                    if player_arts:
+                        player_news_summary[player] = []
+                        for article in player_arts:
+                            news_item = {
+                                'headline': article.get('title', ''),
+                                'category': f'野球・{player}選手',
+                                'key_facts': [article.get('summary', '')],
+                                'mentioned_players': [player],
+                                'date': article.get('publish_date', datetime.now().strftime('%Y-%m-%d')),
+                                'source': article.get('source', 'Google News'),
+                                'query_used': article.get('query_used', ''),
+                                'search_type': 'player_specific',
+                                'target_player': player
+                            }
+                            player_news_summary[player].append(news_item)
+                            recent_news.append(news_item)
+                            
+                            # ポジティブな話題を抽出
+                            title = article.get('title', '')
+                            if any(word in title for word in ['勝利', '活躍', '好調', 'ホームラン', '優勝', 'ヒット', '快勝', '先発', '好投', '復活']):
+                                positive_highlights.append(f"{player}: {title}")
+                
+                # 全体記事も追加
+                for article in general_articles:
+                    news_item = {
+                        'headline': article.get('title', ''),
+                        'category': '野球・ベイスターズ',
+                        'key_facts': [article.get('summary', '')],
+                        'mentioned_players': article.get('baystars_keywords_found', []),
+                        'date': article.get('publish_date', datetime.now().strftime('%Y-%m-%d')),
+                        'source': article.get('source', 'Google News'),
+                        'query_used': article.get('query_used', ''),
+                        'search_type': 'general_team'
+                    }
+                    recent_news.append(news_item)
+                    
+                    # ポジティブな話題を抽出
+                    title = article.get('title', '')
+                    if any(word in title for word in ['勝利', '活躍', '好調', 'ホームラン', '優勝', 'ヒット', '快勝', '先発']):
+                        positive_highlights.append(title)
+                
+                game_info = {
+                    'has_recent_news': True,
+                    'recent_news': recent_news,
+                    'trending_players': trending_players,
+                    'team_situation': f"推し選手個別検索({len(player_articles)}名) + 全体検索で合計{len(articles)}件の記事を収集",
+                    'positive_highlights': positive_highlights,
+                    'data_source': 'comprehensive_rss',
+                    'collection_summary': comprehensive_result['summary'],
+                    'player_specific_news': player_news_summary,
+                    'general_news': [{'headline': g.get('title', ''), 'source': g.get('source', '')} for g in general_articles],
+                    'featured_players': featured_players
+                }
+                
+                self.logger.info(f"Comprehensive RSS collection successful: {len(recent_news)} news items")
+                
+                # 収集結果の詳細ログ出力
+                self.logger.info(f"🎯 推し選手個別検索結果:")
+                for player, player_arts in player_articles.items():
+                    self.logger.info(f"  {player}: {len(player_arts)} 件")
+                    for i, article in enumerate(player_arts, 1):
+                        self.logger.info(f"    [{i}] {article['title'][:50]}... (ソース: {article['source']})")
+                
+                self.logger.info(f"📰 全体検索結果: {len(general_articles)} 件")
+                for i, article in enumerate(general_articles[:2], 1):
+                    self.logger.info(f"  [{i}] {article['title'][:50]}... (ソース: {article['source']})")
+                
+                return game_info
+            else:
+                self.logger.warning("No Baystars news found from RSS, using enhanced fallback")
+                return self._get_enhanced_fallback_game_info()
+            
+        except Exception as e:
+            self.logger.error(f"Google News RSS collection failed: {e}")
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+            return self._get_fallback_game_info()
+    
+    
+    def _extract_player_names(self, text: str) -> List[str]:
+        """テキストから選手名を抽出"""
+        
+        players = ['牧秀悟', '佐野恵太', '三浦大輔', '宮崎敏郎', '今永昇太', '石田裕太郎', '山本拓実']
+        found_players = []
+        
+        for player in players:
+            if player in text:
+                found_players.append(player)
+        
+        return found_players
+    
+    def _extract_trending_players(self, text: str) -> List[str]:
+        """テキストからトレンド選手を抽出"""
+        
+        player_count = {}
+        players = ['牧', '佐野', '三浦', '宮崎', '今永', '石田', '山本']
+        
+        for player in players:
+            count = text.count(player)
+            if count > 0:
+                player_count[player] = count
+        
+        # 出現回数でソート
+        return [player for player, count in sorted(player_count.items(), key=lambda x: x[1], reverse=True)[:3]]
     
     def _find_function_by_name(self, partial_name: str) -> str:
         """関数名の部分一致で Lambda 関数を検索"""
@@ -225,6 +914,58 @@ class DataCollectionAgent(MCPAgent):
             'recent_news': ['チーム一丸となって頑張っています'],
             'player_highlights': ['佐野選手', '牧選手', '松尾選手']
         }
+    
+    def _get_enhanced_fallback_game_info(self) -> Dict[str, Any]:
+        """強化版フォールバック用の試合情報（リアルなベイスターズニュース）"""
+        
+        # 実際のベイスターズに関する最新トピック（2025年シーズン想定）
+        sample_news = [
+            {
+                'title': '牧秀悟キャプテンが連日の猛練習でチームを牽引',
+                'source': 'Yahoo!スポーツ(sample)',
+                'pattern': 'captain_leadership'
+            },
+            {
+                'title': '戸柱恭孝ベテラン捕手が若手投手陣の指導に熱心',
+                'source': 'Yahoo!スポーツ(sample)', 
+                'pattern': 'veteran_guidance'
+            },
+            {
+                'title': '京田陽太の華麗な守備がファンの話題に',
+                'source': 'Yahoo!スポーツ(sample)',
+                'pattern': 'defensive_play'
+            },
+            {
+                'title': '三浦監督「選手たちの成長を感じている」とコメント',
+                'source': 'Yahoo!スポーツ(sample)',
+                'pattern': 'manager_comment'
+            },
+            {
+                'title': 'ハマスタでの練習で選手たちが汗を流す',
+                'source': 'Yahoo!スポーツ(sample)',
+                'pattern': 'practice_scene'
+            }
+        ]
+        
+        # 注目選手（実在選手）
+        trending_players = ['牧秀悟', '戸柱恭孝', '京田陽太']
+        
+        # ポジティブハイライト
+        positive_highlights = [
+            'キャプテン牧の統率力',
+            'ベテラン戸柱の経験',
+            '京田の守備力',
+            'チーム一丸の取り組み',
+            'ファンとの絆'
+        ]
+        
+        return {
+            'recent_news': sample_news,
+            'trending_players': trending_players,
+            'team_situation': f"最新のベイスターズ情報{len(sample_news)}件を収集（サンプルデータ）",
+            'positive_highlights': positive_highlights,
+            'data_source': 'yahoo_sports_scraping'
+        }
 
 class ContentGenerationAgent(MCPAgent):
     """コンテンツ生成エージェント"""
@@ -238,10 +979,32 @@ class ContentGenerationAgent(MCPAgent):
         self.logger.info("Starting content generation...")
         
         collected_data = context.get('collected_data', {})
-        today_jp = datetime.now().strftime('%Y年%m月%d日')
         
-        # 1. コンテキスト分析
-        content_context = self._analyze_context(collected_data)
+        # 日本時間で現在の時刻と時間帯を取得
+        jst = pytz.timezone('Asia/Tokyo')
+        now_jst = datetime.now(jst)
+        today_jp = now_jst.strftime('%Y年%m月%d日')
+        
+        # テスト用時間偽装の確認
+        mock_hour = os.environ.get('MOCK_TIME_HOUR')
+        if mock_hour:
+            current_hour = int(mock_hour)
+            logger.info(f"🕙 テスト用時間偽装: {current_hour}時に設定")
+        else:
+            current_hour = now_jst.hour
+        
+        # 時間帯を判定（9時頃なら朝、21時頃なら夜）
+        if 6 <= current_hour <= 12:
+            time_period = "morning"
+            time_greeting = "おはようございます"
+        else:
+            time_period = "evening"  
+            time_greeting = "お疲れ様です"
+        
+        self.logger.info(f"Current JST time: {now_jst.strftime('%H:%M')}, Period: {time_period}")
+        
+        # 1. コンテキスト分析（時間帯情報を追加）
+        content_context = self._analyze_context(collected_data, time_period, time_greeting)
         
         # 2. 記事生成
         article_content = await self._generate_article(today_jp, content_context)
@@ -261,7 +1024,7 @@ class ContentGenerationAgent(MCPAgent):
             'agent': self.name
         }
     
-    def _analyze_context(self, collected_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _analyze_context(self, collected_data: Dict[str, Any], time_period: str, time_greeting: str) -> Dict[str, Any]:
         """収集されたデータを分析してコンテキストを構築"""
         
         game_info = collected_data.get('game_info', {})
@@ -278,7 +1041,10 @@ class ContentGenerationAgent(MCPAgent):
             'theme': article_theme,
             'featured_players': featured_players[:3],  # 最大3名に拡張
             'news_highlights': news_info[:1],  # 最新1件
-            'generation_style': 'player_focused_positive'  # 選手中心のポジティブ記事
+            'generation_style': 'player_focused_positive',  # 選手中心のポジティブ記事
+            'game_context': game_info,  # GPT-4oからの情報を追加
+            'time_period': time_period,  # 朝/夜の時間帯情報
+            'time_greeting': time_greeting  # 時間帯に応じた挨拶
         }
     
     async def _generate_article(self, today_jp: str, context: Dict[str, Any]) -> str:
@@ -355,41 +1121,184 @@ class ContentGenerationAgent(MCPAgent):
         
         # 試合結果は使わず、選手の情報のみに集中
         
-        # ニュース情報の統合
+        # GPT-4oから収集した最新ニュース情報を統合
         news_context = ""
-        if news:
+        recent_news_context = ""
+        
+        if game_context.get('data_source') == 'gpt4o_news_search':
+            # GPT-4oからの情報を使用
+            recent_news = game_context.get('recent_news', [])
+            team_situation = game_context.get('team_situation', '')
+            positive_highlights = game_context.get('positive_highlights', [])
+            
+            if recent_news:
+                news_items = []
+                for news_item in recent_news[:3]:  # 最新3件
+                    headline = news_item.get('headline', '')
+                    key_facts = ', '.join(news_item.get('key_facts', []))
+                    mentioned_players = ', '.join(news_item.get('mentioned_players', []))
+                    news_items.append(f"・{headline}（{key_facts}）{mentioned_players}")
+                
+                recent_news_context = f"""
+最近のベイスターズニュース:
+{chr(10).join(news_items)}
+
+チーム状況: {team_situation}
+注目ポイント: {', '.join(positive_highlights)}"""
+        
+        elif game_context.get('data_source') == 'comprehensive_rss':
+            # 推し選手個別検索 + 全体検索の情報を使用
+            recent_news = game_context.get('recent_news', [])
+            team_situation = game_context.get('team_situation', '')
+            positive_highlights = game_context.get('positive_highlights', [])
+            trending_players = game_context.get('trending_players', [])
+            collection_summary = game_context.get('collection_summary', {})
+            player_specific_news = game_context.get('player_specific_news', {})
+            general_news = game_context.get('general_news', [])
+            featured_players = game_context.get('featured_players', [])
+            
+            if recent_news:
+                # 推し選手別ニュースを整理
+                player_news_sections = []
+                for player in featured_players:
+                    player_articles = player_specific_news.get(player, [])
+                    if player_articles:
+                        player_section = f"""
+【{player}選手の最新ニュース】:"""
+                        for i, article in enumerate(player_articles[:3], 1):
+                            headline = article.get('headline', '')
+                            source = article.get('source', '')
+                            player_section += f"""
+{i}. {headline}（{source}）"""
+                        player_news_sections.append(player_section)
+                
+                # 全体ニュース
+                general_section = ""
+                if general_news:
+                    general_section = f"""
+【ベイスターズ全体ニュース】:"""
+                    for i, news in enumerate(general_news[:3], 1):
+                        headline = news.get('headline', '')
+                        source = news.get('source', '')
+                        general_section += f"""
+{i}. {headline}（{source}）"""
+                
+                recent_news_context = f"""
+🎯 推し選手個別検索 + ベイスターズ全体検索結果:
+{chr(10).join(player_news_sections)}
+{general_section}
+
+📊 収集サマリー:
+- 推し選手記事: {collection_summary.get('player_articles_count', 0)} 件
+- 全体記事: {collection_summary.get('general_articles_count', 0)} 件
+- 合計: {collection_summary.get('total_articles', 0)} 件
+
+チーム状況: {team_situation}
+注目選手: {', '.join(featured_players)}
+注目ポイント: {', '.join(positive_highlights)}"""
+        
+        elif game_context.get('data_source') == 'google_news_rss':
+            # 旧システム対応（後方互換性）
+            recent_news = game_context.get('recent_news', [])
+            team_situation = game_context.get('team_situation', '')
+            positive_highlights = game_context.get('positive_highlights', [])
+            trending_players = game_context.get('trending_players', [])
+            collection_summary = game_context.get('collection_summary', '')
+            
+            if recent_news:
+                news_items = []
+                for news_item in recent_news[:5]:
+                    headline = news_item.get('headline', '')
+                    source = news_item.get('source', '')
+                    if headline and len(headline) > 10:
+                        news_items.append(f"・{headline}（{source}）")
+                
+                recent_news_context = f"""
+Google News RSSから収集した最新ベイスターズ情報:
+{chr(10).join(news_items)}
+
+チーム状況: {team_situation}
+注目選手・キーワード: {', '.join(trending_players)}
+注目ポイント: {', '.join(positive_highlights)}
+
+{collection_summary}"""
+        
+        elif game_context.get('data_source') == 'yahoo_sports_scraping':
+            # Yahoo!スポーツスクレイピングからの情報を使用（旧システム対応）
+            recent_news = game_context.get('recent_news', [])
+            team_situation = game_context.get('team_situation', '')
+            positive_highlights = game_context.get('positive_highlights', [])
+            trending_players = game_context.get('trending_players', [])
+            
+            if recent_news:
+                news_items = []
+                for news_item in recent_news[:5]:  # 最新5件
+                    title = news_item.get('title', '')
+                    source = news_item.get('source', '')
+                    if title and len(title) > 10:
+                        news_items.append(f"・{title}（{source}）")
+                
+                recent_news_context = f"""
+Yahoo!スポーツから収集した最新ベイスターズ情報:
+{chr(10).join(news_items)}
+
+チーム状況: {team_situation}
+注目選手: {', '.join(trending_players)}
+注目ポイント: {', '.join(positive_highlights)}"""
+        
+        # 従来のニュース情報もバックアップとして使用
+        if news and not recent_news_context:
             news_context = f"最近のチーム状況: {news[0]}"
         
+        # 時間帯情報を取得
+        time_period = context.get('time_period', 'morning')
+        time_greeting = context.get('time_greeting', 'おはようございます')
+        
+        # 時間帯に応じた記事の導入を調整
+        time_context = {
+            'morning': '新しい一日の始まりと共に、ベイスターズの話題をお届けします',
+            'evening': '今日一日の締めくくりに、ベイスターズの最新情報をお楽しみください'
+        }.get(time_period, '今日もベイスターズの話題をお届けします')
+        
         prompt = f"""あなたは横浜DeNAベイスターズの知識豊富で情熱的なファンライターです。
-{today_jp}のベイスターズについて、{theme_instruction}1000-1200文字の高品質な記事を書いてください。
+{time_greeting}！{today_jp}のベイスターズについて、{theme_instruction}1000-1200文字の高品質な記事を書いてください。
+{time_context}。
 
 コンテキスト情報:
 {player_context}
-{news_context}
+{recent_news_context if recent_news_context else news_context}
 
 記事の要件:
 - Markdown形式（# タイトルから開始）
 - ベテランスポーツライター級の文章力で執筆
-- 指定された3名の選手全員を必ず含め、各選手に2-3段落ずつ詳しく言及
-- 各選手の過去のエピソード、プレースタイル、チームでの役割を具体的に描写
-- 選手の人柄や努力、ファンとの関係性にも触れる
-- ベイスターズファンなら共感できる「あるある」ネタも含める
-- 臨場感のある描写（球場の雰囲気、選手の仕草など）
+- **最新ニュース情報を記事の主軸にして構成してください**
+- 収集された各ニュース項目について具体的に言及し、詳しく解説
+- ニュースに関連する選手や出来事を中心に記事を展開
+- 話題になっているトピック（スポンサー契約、トレード、試合情報など）を詳しく紹介
+- ニュースの背景や意義、ファンへの影響を分析的に解説
+- 注目選手については、ニュースと関連付けて自然に紹介
+- ベイスターズファンが知りたい最新情報を網羅的にカバー
+- 臨場感のある描写（球場の雰囲気、ファンの反応など）
 - ハマスタの特別感やファンの熱気も表現
-- 読み応えのある内容で、最後まで読ませる構成
-- ベイスターズ愛が伝わる情熱的で深みのある内容
+- 読み応えのある内容で、最新情報に基づいた価値ある記事
 
 文体の特徴:
 - プロのスポーツライター風の知的で洗練された表現
 - 適度な専門用語（野球用語）を自然に織り込む
 - ファンの心を掴む感動的なフレーズ
-- ユーモアと真剣さのバランス
+- ニュース解説と応援記事のバランス
 
-重要: 
-- 野手選手を投手として、投手選手を野手として書かないよう注意してください
-- 3名の選手それぞれに言及し、バランスよく紹介してください
+重要な指示: 
+- **【最優先】推し選手3名を中心とした記事にしてください**
+- 各推し選手について収集された最新ニュースを詳しく解説してください
+- 推し選手の活躍、成長、努力、魅力を具体的に褒めてください
+- 推し選手に関するニュースが最も重要で、必ず全員について言及してください
+- ベイスターズ全体のニュースも補完的に使用してください
+- 選手個人のエピソード、プレースタイル、人柄を詳しく紹介
+- 選手の最新の状況や話題を正確に反映してください
+- ファンが推し選手について新しい情報を得られる記事にしてください
 - 具体的な試合結果、スコア、勝敗には触れないでください
-- 選手の日頃の努力や魅力に焦点を当ててください"""
+- 推し選手3名全員が記事に反映されていない場合は失格です"""
         
         return prompt
     
@@ -692,6 +1601,7 @@ def lambda_handler(event, context):
     """Lambda エントリーポイント"""
     
     logger.info(f"MCP Orchestrator Event: {json.dumps(event)}")
+    logger.info(f"Feedparser status: {logger_feedparser_status}")
     
     try:
         # MCPオーケストレーターを実行
@@ -705,19 +1615,32 @@ def lambda_handler(event, context):
         result = loop.run_until_complete(orchestrator.execute_pipeline())
         
         if result['status'] == 'success':
-            # S3に記事を保存
-            today = datetime.now().strftime('%Y-%m-%d')
+            # S3に記事を保存（時間帯別ファイル名）
+            jst = pytz.timezone('Asia/Tokyo')
+            now_jst = datetime.now(jst)
+            today = now_jst.strftime('%Y-%m-%d')
+            
+            # 時間偽装の確認
+            mock_hour = os.environ.get('MOCK_TIME_HOUR')
+            if mock_hour:
+                mock_hour_int = int(mock_hour)
+                time_suffix = "morning" if 6 <= mock_hour_int <= 12 else "evening"
+                logger.info(f"🕙 S3保存で時間偽装使用: {mock_hour_int}時 -> {time_suffix}")
+            else:
+                time_suffix = "morning" if 6 <= now_jst.hour <= 12 else "evening"
+            
             bucket_name = os.environ['S3_BUCKET_NAME']
             
             s3_client.put_object(
                 Bucket=bucket_name,
-                Key=f'articles/{today}.md',
+                Key=f'articles/{today}-{time_suffix}.md',
                 Body=result['final_article'].encode('utf-8'),
                 ContentType='text/markdown',
                 Metadata={
                     'generated-by': 'mcp-orchestrator',
                     'quality-score': str(result['quality_score']),
-                    'generation-time': result['pipeline_execution_time']
+                    'generation-time': result['pipeline_execution_time'],
+                    'time-period': time_suffix
                 }
             )
             
