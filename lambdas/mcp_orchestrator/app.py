@@ -5,6 +5,7 @@ import re
 import time
 import hashlib
 from datetime import datetime, timedelta
+import pytz
 import logging
 from typing import Dict, List, Any
 import asyncio
@@ -959,10 +960,25 @@ class ContentGenerationAgent(MCPAgent):
         self.logger.info("Starting content generation...")
         
         collected_data = context.get('collected_data', {})
-        today_jp = datetime.now().strftime('%Y年%m月%d日')
         
-        # 1. コンテキスト分析
-        content_context = self._analyze_context(collected_data)
+        # 日本時間で現在の時刻と時間帯を取得
+        jst = pytz.timezone('Asia/Tokyo')
+        now_jst = datetime.now(jst)
+        today_jp = now_jst.strftime('%Y年%m月%d日')
+        current_hour = now_jst.hour
+        
+        # 時間帯を判定（9時頃なら朝、21時頃なら夜）
+        if 6 <= current_hour <= 12:
+            time_period = "morning"
+            time_greeting = "おはようございます"
+        else:
+            time_period = "evening"  
+            time_greeting = "お疲れ様です"
+        
+        self.logger.info(f"Current JST time: {now_jst.strftime('%H:%M')}, Period: {time_period}")
+        
+        # 1. コンテキスト分析（時間帯情報を追加）
+        content_context = self._analyze_context(collected_data, time_period, time_greeting)
         
         # 2. 記事生成
         article_content = await self._generate_article(today_jp, content_context)
@@ -982,7 +998,7 @@ class ContentGenerationAgent(MCPAgent):
             'agent': self.name
         }
     
-    def _analyze_context(self, collected_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _analyze_context(self, collected_data: Dict[str, Any], time_period: str, time_greeting: str) -> Dict[str, Any]:
         """収集されたデータを分析してコンテキストを構築"""
         
         game_info = collected_data.get('game_info', {})
@@ -1000,7 +1016,9 @@ class ContentGenerationAgent(MCPAgent):
             'featured_players': featured_players[:3],  # 最大3名に拡張
             'news_highlights': news_info[:1],  # 最新1件
             'generation_style': 'player_focused_positive',  # 選手中心のポジティブ記事
-            'game_context': game_info  # GPT-4oからの情報を追加
+            'game_context': game_info,  # GPT-4oからの情報を追加
+            'time_period': time_period,  # 朝/夜の時間帯情報
+            'time_greeting': time_greeting  # 時間帯に応じた挨拶
         }
     
     async def _generate_article(self, today_jp: str, context: Dict[str, Any]) -> str:
@@ -1206,8 +1224,19 @@ Yahoo!スポーツから収集した最新ベイスターズ情報:
         if news and not recent_news_context:
             news_context = f"最近のチーム状況: {news[0]}"
         
+        # 時間帯情報を取得
+        time_period = context.get('time_period', 'morning')
+        time_greeting = context.get('time_greeting', 'おはようございます')
+        
+        # 時間帯に応じた記事の導入を調整
+        time_context = {
+            'morning': '新しい一日の始まりと共に、ベイスターズの話題をお届けします',
+            'evening': '今日一日の締めくくりに、ベイスターズの最新情報をお楽しみください'
+        }.get(time_period, '今日もベイスターズの話題をお届けします')
+        
         prompt = f"""あなたは横浜DeNAベイスターズの知識豊富で情熱的なファンライターです。
-{today_jp}のベイスターズについて、{theme_instruction}1000-1200文字の高品質な記事を書いてください。
+{time_greeting}！{today_jp}のベイスターズについて、{theme_instruction}1000-1200文字の高品質な記事を書いてください。
+{time_context}。
 
 コンテキスト情報:
 {player_context}
@@ -1559,19 +1588,24 @@ def lambda_handler(event, context):
         result = loop.run_until_complete(orchestrator.execute_pipeline())
         
         if result['status'] == 'success':
-            # S3に記事を保存
-            today = datetime.now().strftime('%Y-%m-%d')
+            # S3に記事を保存（時間帯別ファイル名）
+            jst = pytz.timezone('Asia/Tokyo')
+            now_jst = datetime.now(jst)
+            today = now_jst.strftime('%Y-%m-%d')
+            time_suffix = "morning" if 6 <= now_jst.hour <= 12 else "evening"
+            
             bucket_name = os.environ['S3_BUCKET_NAME']
             
             s3_client.put_object(
                 Bucket=bucket_name,
-                Key=f'articles/{today}.md',
+                Key=f'articles/{today}-{time_suffix}.md',
                 Body=result['final_article'].encode('utf-8'),
                 ContentType='text/markdown',
                 Metadata={
                     'generated-by': 'mcp-orchestrator',
                     'quality-score': str(result['quality_score']),
-                    'generation-time': result['pipeline_execution_time']
+                    'generation-time': result['pipeline_execution_time'],
+                    'time-period': time_suffix
                 }
             )
             
