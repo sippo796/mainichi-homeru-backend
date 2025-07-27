@@ -548,11 +548,16 @@ class DataCollectionAgent(MCPAgent):
         
         self.logger.info("Starting data collection...")
         
+        # 時間帯を判定
+        jst = pytz.timezone('Asia/Tokyo')
+        now_jst = datetime.now(jst)
+        time_period = "morning" if 6 <= now_jst.hour <= 12 else "evening"
+        
         # 1. 試合情報収集
         game_info = await self._fetch_game_info()
         
-        # 2. 選手情報更新
-        player_info = await self._fetch_current_players()
+        # 2. 選手情報更新（時間帯別）
+        player_info = await self._fetch_current_players(time_period)
         
         # 3. ニュース情報収集
         news_info = await self._fetch_news()
@@ -585,7 +590,7 @@ class DataCollectionAgent(MCPAgent):
             self.logger.error(f"Error fetching recent news: {e}")
             return self._get_fallback_game_info()
     
-    async def _fetch_current_players(self) -> Dict[str, Any]:
+    async def _fetch_current_players(self, time_period: str = None) -> Dict[str, Any]:
         """現在の選手情報を取得（2025年実際のロスター）"""
         
         # 2025年シーズンの実際の一軍登録選手
@@ -596,8 +601,8 @@ class DataCollectionAgent(MCPAgent):
             'outfielders': ['佐野恵太', '桑原将志', '神里和毅', '関根大気', '蝦名達夫', '筒香嘉智']
         }
         
-        # スマート選手選択（日付ベースのローテーション + ランダム要素）
-        selected_players = self._select_featured_players(current_players)
+        # スマート選手選択（時間帯別対応）
+        selected_players = self._select_featured_players(current_players, time_period)
         
         return {
             'roster': current_players,
@@ -605,21 +610,43 @@ class DataCollectionAgent(MCPAgent):
             'last_updated': datetime.now().isoformat()
         }
     
-    def _select_featured_players(self, roster: Dict[str, List[str]]) -> List[str]:
-        """今日注目する選手をスマートに選択（3名、複数ランダム要素）"""
+    def _select_featured_players(self, roster: Dict[str, List[str]], time_period: str = None) -> List[str]:
+        """今日注目する選手をスマートに選択（3名、時間帯別対応）"""
         
         import random
         from datetime import datetime
         
-        today = datetime.now()
+        # 日本時間で現在の時刻を取得
+        jst = pytz.timezone('Asia/Tokyo')
+        now_jst = datetime.now(jst)
         
-        # 複数のランダム要素を組み合わせてシードを作成
-        base_seed = today.day + today.month + today.year
-        weather_factor = (today.day * 7) % 13  # 天気っぽいランダム要素
-        season_factor = (today.month - 1) // 3  # 季節要素（0-3）
-        lunar_cycle = today.day % 28  # 月齢っぽいサイクル
+        # 時間帯を判定（引数で指定されていない場合）
+        if not time_period:
+            time_period = "morning" if 6 <= now_jst.hour <= 12 else "evening"
         
-        random.seed(base_seed + weather_factor + season_factor + lunar_cycle)
+        # 時間帯別のシード値を生成
+        base_seed = now_jst.day + now_jst.month + now_jst.year
+        time_factor = 100 if time_period == "morning" else 200  # 朝・夜で大きく異なる値
+        weather_factor = (now_jst.day * 7) % 13  # 天気っぽいランダム要素
+        season_factor = (now_jst.month - 1) // 3  # 季節要素（0-3）
+        lunar_cycle = now_jst.day % 28  # 月齢っぽいサイクル
+        
+        # 時間帯を含む複合シード
+        random.seed(base_seed + time_factor + weather_factor + season_factor + lunar_cycle)
+        
+        self.logger.info(f"🎯 選手選択 - 時間帯: {time_period}, シード: {base_seed + time_factor}")
+        
+        # 時間帯別の選手選択傾向
+        time_based_focus = {
+            'morning': {
+                'primary_boost': 'pitchers',    # 朝は投手陣に注目
+                'secondary_boost': 'catchers'   # バッテリー重視
+            },
+            'evening': {
+                'primary_boost': 'outfielders', # 夜は野手陣に注目
+                'secondary_boost': 'infielders' # 内野手も重視
+            }
+        }
         
         # 曜日別の選手選択傾向
         weekday_focus = {
@@ -643,8 +670,21 @@ class DataCollectionAgent(MCPAgent):
         selected_players = []
         used_positions = []
         
-        # 1人目：メインの注目選手（曜日ベース）
-        primary_position = weekday_focus[today.weekday()]
+        # 時間帯による選手選択の影響
+        time_focus = time_based_focus.get(time_period, {'primary_boost': 'pitchers', 'secondary_boost': 'catchers'})
+        
+        # 1人目：時間帯重視 + 曜日傾向の組み合わせ
+        weekday_position = weekday_focus[now_jst.weekday()]
+        time_boost_position = time_focus['primary_boost']
+        
+        # 40%の確率で時間帯重視、60%の確率で曜日重視
+        if random.random() < 0.4:
+            primary_position = time_boost_position
+            self.logger.info(f"   🌅 時間帯重視選択: {time_boost_position}")
+        else:
+            primary_position = weekday_position
+            self.logger.info(f"   📅 曜日重視選択: {weekday_position}")
+        
         main_player = random.choice(roster[primary_position])
         selected_players.append(main_player)
         used_positions.append(primary_position)
@@ -684,6 +724,9 @@ class DataCollectionAgent(MCPAgent):
         # 追加のランダム要素：稀に順番をシャッフル
         if random.random() < 0.2:  # 20%の確率で順番シャッフル
             random.shuffle(selected_players)
+            self.logger.info(f"   🔀 順番シャッフル実行")
+        
+        self.logger.info(f"✅ 推し選手決定: {', '.join(selected_players)} ({time_period})")
         
         return selected_players
     
@@ -739,8 +782,13 @@ class DataCollectionAgent(MCPAgent):
         try:
             self.logger.info("Starting comprehensive RSS collection for featured players + team news...")
             
-            # 推し選手を取得（選手情報から）
-            player_info = await self._fetch_current_players()
+            # 時間帯を判定
+            jst = pytz.timezone('Asia/Tokyo')
+            now_jst = datetime.now(jst)
+            time_period = "morning" if 6 <= now_jst.hour <= 12 else "evening"
+            
+            # 推し選手を取得（時間帯別選手情報から）
+            player_info = await self._fetch_current_players(time_period)
             featured_players = player_info.get('featured_players', ['佐野恵太', '牧秀悟', '松尾汐恩'])
             
             # 推し選手個別 + 全体ニュース収集
