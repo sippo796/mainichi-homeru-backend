@@ -636,9 +636,10 @@ class DataCollectionAgent(MCPAgent):
         # 時間帯別の基本要素
         time_factor = 100 if time_period == "morning" else 200
         date_factor = now_jst.day + now_jst.month * 32 + now_jst.year * 365
+        season_factor = (now_jst.month - 1) // 3  # 季節要素（0-3: 春夏秋冬）
         
         # 全てをハッシュ化して整数シードを生成
-        seed_string = f"{timestamp_ns}-{process_id}-{random_bytes.hex()}-{time_factor}-{date_factor}"
+        seed_string = f"{timestamp_ns}-{process_id}-{random_bytes.hex()}-{time_factor}-{date_factor}-{season_factor}"
         seed_hash = hashlib.md5(seed_string.encode()).hexdigest()
         final_seed = int(seed_hash[:8], 16)  # ハッシュの最初の8文字を16進数として使用
         
