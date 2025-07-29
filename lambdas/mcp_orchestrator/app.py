@@ -624,17 +624,29 @@ class DataCollectionAgent(MCPAgent):
         if not time_period:
             time_period = "morning" if 6 <= now_jst.hour <= 12 else "evening"
         
-        # 時間帯別のシード値を生成
-        base_seed = now_jst.day + now_jst.month + now_jst.year
-        time_factor = 100 if time_period == "morning" else 200  # 朝・夜で大きく異なる値
-        weather_factor = (now_jst.day * 7) % 13  # 天気っぽいランダム要素
-        season_factor = (now_jst.month - 1) // 3  # 季節要素（0-3）
-        lunar_cycle = now_jst.day % 28  # 月齢っぽいサイクル
+        # 真のランダム性を実現するためにsystem時刻とランダム要素を組み合わせ
+        import hashlib
+        import os
         
-        # 時間帯を含む複合シード
-        random.seed(base_seed + time_factor + weather_factor + season_factor + lunar_cycle)
+        # 複数のランダム要素を組み合わせ
+        timestamp_ns = now_jst.timestamp() * 1000000 + now_jst.microsecond  # ナノ秒レベルの精度
+        process_id = os.getpid()  # プロセスID
+        random_bytes = os.urandom(8)  # OSレベルのランダムバイト
         
-        self.logger.info(f"🎯 選手選択 - 時間帯: {time_period}, シード: {base_seed + time_factor}")
+        # 時間帯別の基本要素
+        time_factor = 100 if time_period == "morning" else 200
+        date_factor = now_jst.day + now_jst.month * 32 + now_jst.year * 365
+        
+        # 全てをハッシュ化して整数シードを生成
+        seed_string = f"{timestamp_ns}-{process_id}-{random_bytes.hex()}-{time_factor}-{date_factor}"
+        seed_hash = hashlib.md5(seed_string.encode()).hexdigest()
+        final_seed = int(seed_hash[:8], 16)  # ハッシュの最初の8文字を16進数として使用
+        
+        # ランダムシード設定
+        random.seed(final_seed)
+        
+        self.logger.info(f"🎯 選手選択 - 時間帯: {time_period}, 時刻: {now_jst.strftime('%H:%M:%S.%f')}, シード: {final_seed}")
+        self.logger.info(f"   📊 シード生成要素: timestamp={timestamp_ns}, pid={process_id}, random={random_bytes.hex()[:8]}")
         
         # 時間帯別の選手選択傾向
         time_based_focus = {
@@ -1636,24 +1648,26 @@ def lambda_handler(event, context):
         result = loop.run_until_complete(orchestrator.execute_pipeline())
         
         if result['status'] == 'success':
-            # S3に記事を保存（時間帯別ファイル名）
+            # S3に記事を保存（新しいフォルダ構造: articles/YYYY-MM-DD/HHMM.md）
             jst = pytz.timezone('Asia/Tokyo')
             now_jst = datetime.now(jst)
             today = now_jst.strftime('%Y-%m-%d')
+            time_hhmm = now_jst.strftime('%H%M')
             time_suffix = "morning" if 6 <= now_jst.hour <= 12 else "evening"
             
             bucket_name = os.environ['S3_BUCKET_NAME']
             
             s3_client.put_object(
                 Bucket=bucket_name,
-                Key=f'articles/{today}-{time_suffix}.md',
+                Key=f'articles/{today}/{time_hhmm}.md',
                 Body=result['final_article'].encode('utf-8'),
                 ContentType='text/markdown',
                 Metadata={
                     'generated-by': 'mcp-orchestrator',
                     'quality-score': str(result['quality_score']),
                     'generation-time': result['pipeline_execution_time'],
-                    'time-period': time_suffix
+                    'time-period': time_suffix,
+                    'time-hhmm': time_hhmm
                 }
             )
             

@@ -27,6 +27,25 @@ def lambda_handler(event, context):
         }
 
     try:
+        # クエリパラメータを取得
+        query_params = event.get('queryStringParameters') or {}
+        
+        try:
+            limit = int(query_params.get('limit', 10))  # デフォルト10件
+            page = int(query_params.get('page', 1))     # デフォルト1ページ目
+        except (ValueError, TypeError):
+            # パラメータが数値でない場合はデフォルト値を使用
+            limit = 10
+            page = 1
+        
+        # バリデーション
+        if limit <= 0 or limit > 100:  # 最大100件制限
+            limit = 10
+        if page <= 0:
+            page = 1
+            
+        logger.info(f"Pagination: limit={limit}, page={page}")
+        
         bucket_name = os.environ.get('S3_BUCKET_NAME', 'test-bucket')
         logger.info(f"Using bucket: {bucket_name}")
         
@@ -48,21 +67,37 @@ def lambda_handler(event, context):
                 }
             ]
             
+            # ページネーション適用
+            total_count = len(mock_articles)
+            start_index = (page - 1) * limit
+            end_index = start_index + limit
+            paginated_articles = mock_articles[start_index:end_index]
+            
             return {
                 'statusCode': 200,
                 'headers': {
                     'Content-Type': 'application/json',
                     'Access-Control-Allow-Origin': '*'
                 },
-                'body': json.dumps({'articles': mock_articles}, ensure_ascii=False)
+                'body': json.dumps({
+                    'articles': paginated_articles,
+                    'pagination': {
+                        'currentPage': page,
+                        'limit': limit,
+                        'totalCount': total_count,
+                        'totalPages': (total_count + limit - 1) // limit,
+                        'hasNext': end_index < total_count,
+                        'hasPrev': page > 1
+                    }
+                }, ensure_ascii=False)
             }
 
-        # 本番環境：実際のS3から記事一覧を取得
+        # 本番環境：実際のS3から記事一覧を取得（新しいフォルダ構造対応）
         try:
-            response = s3_client.list_objects_v2(
+            # まず全件取得して総数を把握（ページネーション情報のため）
+            all_response = s3_client.list_objects_v2(
                 Bucket=bucket_name,
-                Prefix='articles/',
-                MaxKeys=10
+                Prefix='articles/'
             )
         except ClientError as e:
             if e.response['Error']['Code'] == 'NoSuchBucket':
@@ -73,33 +108,74 @@ def lambda_handler(event, context):
                         'Content-Type': 'application/json',
                         'Access-Control-Allow-Origin': '*'
                     },
-                    'body': json.dumps({'articles': []}, ensure_ascii=False)
+                    'body': json.dumps({
+                        'articles': [],
+                        'pagination': {
+                            'currentPage': page,
+                            'limit': limit,
+                            'totalCount': 0,
+                            'totalPages': 0,
+                            'hasNext': False,
+                            'hasPrev': False
+                        }
+                    }, ensure_ascii=False)
                 }
             else:
                 raise e
 
-        if 'Contents' not in response:
+        if 'Contents' not in all_response:
             return {
                 'statusCode': 200,
                 'headers': {
                     'Content-Type': 'application/json',
                     'Access-Control-Allow-Origin': '*'
                 },
-                'body': json.dumps({'articles': []})
+                'body': json.dumps({
+                    'articles': [],
+                    'pagination': {
+                        'currentPage': page,
+                        'limit': limit,
+                        'totalCount': 0,
+                        'totalPages': 0,
+                        'hasNext': False,
+                        'hasPrev': False
+                    }
+                }, ensure_ascii=False)
             }
 
+        # mdファイルのみフィルタしてソート
+        all_md_objects = [obj for obj in all_response['Contents'] if obj['Key'].endswith('.md')]
+        sorted_objects = sorted(all_md_objects, key=lambda x: x['LastModified'], reverse=True)
+        
+        # 総件数とページネーション計算
+        total_count = len(sorted_objects)
+        total_pages = (total_count + limit - 1) // limit if total_count > 0 else 0
+        start_index = (page - 1) * limit
+        end_index = start_index + limit
+        
+        # 現在のページに該当するオブジェクトのみ処理
+        paginated_objects = sorted_objects[start_index:end_index]
+        
         articles = []
 
-        # 最新5件を取得してプレビュー作成
-        sorted_objects = sorted(
-            [obj for obj in response['Contents'] if obj['Key'].endswith('.md')],
-            key=lambda x: x['LastModified'],
-            reverse=True
-        )[:5]
-
-        for obj in sorted_objects:
+        for obj in paginated_objects:
             try:
-                date = obj['Key'].replace('articles/', '').replace('.md', '')
+                # 新しいフォルダ構造: articles/YYYY-MM-DD/HHMM.md
+                key_parts = obj['Key'].split('/')
+                if len(key_parts) != 3 or not key_parts[2].endswith('.md'):
+                    continue  # 新しい構造に従わないファイルはスキップ
+                
+                date = key_parts[1]  # YYYY-MM-DD
+                time_file = key_parts[2].replace('.md', '')  # HHMM
+                
+                # 表示用の日時文字列を作成
+                try:
+                    hour = int(time_file[:2])
+                    minute = int(time_file[2:])
+                    time_display = f"{hour:02d}:{minute:02d}"
+                    datetime_display = f"{date} {time_display}"
+                except ValueError:
+                    datetime_display = f"{date} {time_file}"
 
                 # プレビュー取得（最初の500文字程度、安全にデコード）
                 try:
@@ -123,6 +199,9 @@ def lambda_handler(event, context):
 
                 articles.append({
                     'date': date,
+                    'time': time_file,
+                    'datetime': datetime_display,
+                    'articleId': f"{date}--{time_file}",  # API Gateway用の単一パラメータ形式
                     'title': title,
                     'preview': preview_text,
                     'lastModified': obj['LastModified'].isoformat()
@@ -170,7 +249,17 @@ def lambda_handler(event, context):
                 'ETag': f'"{etag}"',
                 'Last-Modified': articles[0]['lastModified'] if articles else datetime.now(jst).isoformat()
             },
-            'body': json.dumps({'articles': articles}, ensure_ascii=False)
+            'body': json.dumps({
+                'articles': articles,
+                'pagination': {
+                    'currentPage': page,
+                    'limit': limit,
+                    'totalCount': total_count,
+                    'totalPages': total_pages,
+                    'hasNext': end_index < total_count,
+                    'hasPrev': page > 1
+                }
+            }, ensure_ascii=False)
         }
 
     except Exception as e:
